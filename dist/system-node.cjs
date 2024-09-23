@@ -1,7 +1,7 @@
 /******/ (() => { // webpackBootstrap
 /******/ 	var __webpack_modules__ = ({
 
-/***/ 18:
+/***/ 793:
 /***/ ((module) => {
 
 /* eslint-disable node/no-deprecated-api */
@@ -80,7 +80,7 @@ module.exports = bufferFrom
 
 /***/ }),
 
-/***/ 467:
+/***/ 869:
 /***/ ((module, exports, __nccwpck_require__) => {
 
 "use strict";
@@ -93,7 +93,7 @@ function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'defau
 var Stream = _interopDefault(__nccwpck_require__(781));
 var http = _interopDefault(__nccwpck_require__(685));
 var Url = _interopDefault(__nccwpck_require__(310));
-var whatwgUrl = _interopDefault(__nccwpck_require__(665));
+var whatwgUrl = _interopDefault(__nccwpck_require__(241));
 var https = _interopDefault(__nccwpck_require__(687));
 var zlib = _interopDefault(__nccwpck_require__(796));
 
@@ -246,7 +246,7 @@ FetchError.prototype.name = 'FetchError';
 
 let convert;
 try {
-	convert = (__nccwpck_require__(877).convert);
+	convert = (__nccwpck_require__(628).convert);
 } catch (e) {}
 
 const INTERNALS = Symbol('Body internals');
@@ -1451,10 +1451,6 @@ function getNodeRequestOptions(request) {
 		agent = agent(parsedURL);
 	}
 
-	if (!headers.has('Connection') && !agent) {
-		headers.set('Connection', 'close');
-	}
-
 	// HTTP-network fetch step 4.2
 	// chunked encoding is handled by Node.js
 
@@ -1504,6 +1500,20 @@ const isDomainOrSubdomain = function isDomainOrSubdomain(destination, original) 
 };
 
 /**
+ * isSameProtocol reports whether the two provided URLs use the same protocol.
+ *
+ * Both domains must already be in canonical form.
+ * @param {string|URL} original
+ * @param {string|URL} destination
+ */
+const isSameProtocol = function isSameProtocol(destination, original) {
+	const orig = new URL$1(original).protocol;
+	const dest = new URL$1(destination).protocol;
+
+	return orig === dest;
+};
+
+/**
  * Fetch function
  *
  * @param   Mixed    url   Absolute url or Request instance
@@ -1534,7 +1544,7 @@ function fetch(url, opts) {
 			let error = new AbortError('The user aborted a request.');
 			reject(error);
 			if (request.body && request.body instanceof Stream.Readable) {
-				request.body.destroy(error);
+				destroyStream(request.body, error);
 			}
 			if (!response || !response.body) return;
 			response.body.emit('error', error);
@@ -1575,8 +1585,42 @@ function fetch(url, opts) {
 
 		req.on('error', function (err) {
 			reject(new FetchError(`request to ${request.url} failed, reason: ${err.message}`, 'system', err));
+
+			if (response && response.body) {
+				destroyStream(response.body, err);
+			}
+
 			finalize();
 		});
+
+		fixResponseChunkedTransferBadEnding(req, function (err) {
+			if (signal && signal.aborted) {
+				return;
+			}
+
+			if (response && response.body) {
+				destroyStream(response.body, err);
+			}
+		});
+
+		/* c8 ignore next 18 */
+		if (parseInt(process.version.substring(1)) < 14) {
+			// Before Node.js 14, pipeline() does not fully support async iterators and does not always
+			// properly handle when the socket close/end events are out of order.
+			req.on('socket', function (s) {
+				s.addListener('close', function (hadError) {
+					// if a data listener is still present we didn't end cleanly
+					const hasDataListener = s.listenerCount('data') > 0;
+
+					// if end happened before close but the socket didn't emit an error, do it now
+					if (response && hasDataListener && !hadError && !(signal && signal.aborted)) {
+						const err = new Error('Premature close');
+						err.code = 'ERR_STREAM_PREMATURE_CLOSE';
+						response.body.emit('error', err);
+					}
+				});
+			});
+		}
 
 		req.on('response', function (res) {
 			clearTimeout(reqTimeout);
@@ -1649,7 +1693,7 @@ function fetch(url, opts) {
 							size: request.size
 						};
 
-						if (!isDomainOrSubdomain(request.url, locationURL)) {
+						if (!isDomainOrSubdomain(request.url, locationURL) || !isSameProtocol(request.url, locationURL)) {
 							for (const name of ['authorization', 'www-authenticate', 'cookie', 'cookie2']) {
 								requestOpts.headers.delete(name);
 							}
@@ -1742,6 +1786,13 @@ function fetch(url, opts) {
 					response = new Response(body, response_options);
 					resolve(response);
 				});
+				raw.on('end', function () {
+					// some old IIS servers return zero-length OK deflate responses, so 'data' is never emitted.
+					if (!response) {
+						response = new Response(body, response_options);
+						resolve(response);
+					}
+				});
 				return;
 			}
 
@@ -1761,6 +1812,44 @@ function fetch(url, opts) {
 		writeToStream(req, request);
 	});
 }
+function fixResponseChunkedTransferBadEnding(request, errorCallback) {
+	let socket;
+
+	request.on('socket', function (s) {
+		socket = s;
+	});
+
+	request.on('response', function (response) {
+		const headers = response.headers;
+
+		if (headers['transfer-encoding'] === 'chunked' && !headers['content-length']) {
+			response.once('close', function (hadError) {
+				// tests for socket presence, as in some situations the
+				// the 'socket' event is not triggered for the request
+				// (happens in deno), avoids `TypeError`
+				// if a data listener is still present we didn't end cleanly
+				const hasDataListener = socket && socket.listenerCount('data') > 0;
+
+				if (hasDataListener && !hadError) {
+					const err = new Error('Premature close');
+					err.code = 'ERR_STREAM_PREMATURE_CLOSE';
+					errorCallback(err);
+				}
+			});
+		}
+	});
+}
+
+function destroyStream(stream, err) {
+	if (stream.destroy) {
+		stream.destroy(err);
+	} else {
+		// node < 8
+		stream.emit('error', err);
+		stream.end();
+	}
+}
+
 /**
  * Redirect code matching
  *
@@ -1781,15 +1870,16 @@ exports.Headers = Headers;
 exports.Request = Request;
 exports.Response = Response;
 exports.FetchError = FetchError;
+exports.AbortError = AbortError;
 
 
 /***/ }),
 
-/***/ 249:
+/***/ 501:
 /***/ ((module, exports, __nccwpck_require__) => {
 
 /* module decorator */ module = __nccwpck_require__.nmd(module);
-var SourceMapConsumer = (__nccwpck_require__(594).SourceMapConsumer);
+var SourceMapConsumer = (__nccwpck_require__(101).SourceMapConsumer);
 var path = __nccwpck_require__(17);
 
 var fs;
@@ -1803,7 +1893,7 @@ try {
   /* nop */
 }
 
-var bufferFrom = __nccwpck_require__(18);
+var bufferFrom = __nccwpck_require__(793);
 
 /**
  * Requires a module which is protected against bundler minification.
@@ -2418,7 +2508,7 @@ exports.resetRetrieveHandlers = function() {
 
 /***/ }),
 
-/***/ 375:
+/***/ 947:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -2428,7 +2518,7 @@ exports.resetRetrieveHandlers = function() {
  * http://opensource.org/licenses/BSD-3-Clause
  */
 
-var util = __nccwpck_require__(344);
+var util = __nccwpck_require__(559);
 var has = Object.prototype.hasOwnProperty;
 var hasNativeMap = typeof Map !== "undefined";
 
@@ -2546,7 +2636,7 @@ exports.I = ArraySet;
 
 /***/ }),
 
-/***/ 975:
+/***/ 216:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -2586,7 +2676,7 @@ exports.I = ArraySet;
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-var base64 = __nccwpck_require__(156);
+var base64 = __nccwpck_require__(969);
 
 // A single base 64 digit can contain 6 bits of data. For the base 64 variable
 // length quantities we use in the source map spec, the first bit is the sign,
@@ -2693,7 +2783,7 @@ exports.decode = function base64VLQ_decode(aStr, aIndex, aOutParam) {
 
 /***/ }),
 
-/***/ 156:
+/***/ 969:
 /***/ ((__unused_webpack_module, exports) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -2767,7 +2857,7 @@ exports.decode = function (charCode) {
 
 /***/ }),
 
-/***/ 600:
+/***/ 91:
 /***/ ((__unused_webpack_module, exports) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -2885,7 +2975,7 @@ exports.search = function search(aNeedle, aHaystack, aCompare, aBias) {
 
 /***/ }),
 
-/***/ 817:
+/***/ 278:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -2895,7 +2985,7 @@ exports.search = function search(aNeedle, aHaystack, aCompare, aBias) {
  * http://opensource.org/licenses/BSD-3-Clause
  */
 
-var util = __nccwpck_require__(344);
+var util = __nccwpck_require__(559);
 
 /**
  * Determine whether mappingB is after mappingA with respect to generated
@@ -2971,7 +3061,7 @@ exports.H = MappingList;
 
 /***/ }),
 
-/***/ 254:
+/***/ 638:
 /***/ ((__unused_webpack_module, exports) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -3092,7 +3182,7 @@ exports.U = function (ary, comparator) {
 
 /***/ }),
 
-/***/ 155:
+/***/ 819:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 var __webpack_unused_export__;
@@ -3103,11 +3193,11 @@ var __webpack_unused_export__;
  * http://opensource.org/licenses/BSD-3-Clause
  */
 
-var util = __nccwpck_require__(344);
-var binarySearch = __nccwpck_require__(600);
-var ArraySet = (__nccwpck_require__(375)/* .ArraySet */ .I);
-var base64VLQ = __nccwpck_require__(975);
-var quickSort = (__nccwpck_require__(254)/* .quickSort */ .U);
+var util = __nccwpck_require__(559);
+var binarySearch = __nccwpck_require__(91);
+var ArraySet = (__nccwpck_require__(947)/* .ArraySet */ .I);
+var base64VLQ = __nccwpck_require__(216);
+var quickSort = (__nccwpck_require__(638)/* .quickSort */ .U);
 
 function SourceMapConsumer(aSourceMap, aSourceMapURL) {
   var sourceMap = aSourceMap;
@@ -4245,7 +4335,7 @@ __webpack_unused_export__ = IndexedSourceMapConsumer;
 
 /***/ }),
 
-/***/ 425:
+/***/ 94:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -4255,10 +4345,10 @@ __webpack_unused_export__ = IndexedSourceMapConsumer;
  * http://opensource.org/licenses/BSD-3-Clause
  */
 
-var base64VLQ = __nccwpck_require__(975);
-var util = __nccwpck_require__(344);
-var ArraySet = (__nccwpck_require__(375)/* .ArraySet */ .I);
-var MappingList = (__nccwpck_require__(817)/* .MappingList */ .H);
+var base64VLQ = __nccwpck_require__(216);
+var util = __nccwpck_require__(559);
+var ArraySet = (__nccwpck_require__(947)/* .ArraySet */ .I);
+var MappingList = (__nccwpck_require__(278)/* .MappingList */ .H);
 
 /**
  * An instance of the SourceMapGenerator represents a source map which is
@@ -4677,7 +4767,7 @@ exports.h = SourceMapGenerator;
 
 /***/ }),
 
-/***/ 616:
+/***/ 435:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 var __webpack_unused_export__;
@@ -4688,8 +4778,8 @@ var __webpack_unused_export__;
  * http://opensource.org/licenses/BSD-3-Clause
  */
 
-var SourceMapGenerator = (__nccwpck_require__(425)/* .SourceMapGenerator */ .h);
-var util = __nccwpck_require__(344);
+var SourceMapGenerator = (__nccwpck_require__(94)/* .SourceMapGenerator */ .h);
+var util = __nccwpck_require__(559);
 
 // Matches a Windows-style `\r\n` newline or a `\n` newline used by all other
 // operating systems these days (capturing the result).
@@ -5098,7 +5188,7 @@ __webpack_unused_export__ = SourceNode;
 
 /***/ }),
 
-/***/ 344:
+/***/ 559:
 /***/ ((__unused_webpack_module, exports) => {
 
 /* -*- Mode: js; js-indent-level: 2; -*- */
@@ -5593,7 +5683,7 @@ exports.computeSourceURL = computeSourceURL;
 
 /***/ }),
 
-/***/ 594:
+/***/ 101:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 /*
@@ -5601,21 +5691,21 @@ exports.computeSourceURL = computeSourceURL;
  * Licensed under the New BSD license. See LICENSE.txt or:
  * http://opensource.org/licenses/BSD-3-Clause
  */
-/* unused reexport */ __nccwpck_require__(425)/* .SourceMapGenerator */ .h;
-exports.SourceMapConsumer = __nccwpck_require__(155).SourceMapConsumer;
-/* unused reexport */ __nccwpck_require__(616);
+/* unused reexport */ __nccwpck_require__(94)/* .SourceMapGenerator */ .h;
+exports.SourceMapConsumer = __nccwpck_require__(819).SourceMapConsumer;
+/* unused reexport */ __nccwpck_require__(435);
 
 
 /***/ }),
 
-/***/ 256:
+/***/ 12:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
 
 var punycode = __nccwpck_require__(477);
-var mappingTable = __nccwpck_require__(20);
+var mappingTable = __nccwpck_require__(229);
 
 var PROCESSING_OPTIONS = {
   TRANSITIONAL: 0,
@@ -5809,7 +5899,7 @@ module.exports.PROCESSING_OPTIONS = PROCESSING_OPTIONS;
 
 /***/ }),
 
-/***/ 886:
+/***/ 478:
 /***/ ((module) => {
 
 "use strict";
@@ -6006,12 +6096,12 @@ conversions["RegExp"] = function (V, opts) {
 
 /***/ }),
 
-/***/ 537:
+/***/ 443:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
-const usm = __nccwpck_require__(158);
+const usm = __nccwpck_require__(282);
 
 exports.implementation = class URLImpl {
   constructor(constructorArgs) {
@@ -6214,15 +6304,15 @@ exports.implementation = class URLImpl {
 
 /***/ }),
 
-/***/ 394:
+/***/ 622:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
 
-const conversions = __nccwpck_require__(886);
-const utils = __nccwpck_require__(185);
-const Impl = __nccwpck_require__(537);
+const conversions = __nccwpck_require__(478);
+const utils = __nccwpck_require__(126);
+const Impl = __nccwpck_require__(443);
 
 const impl = utils.implSymbol;
 
@@ -6418,32 +6508,32 @@ module.exports = {
 
 /***/ }),
 
-/***/ 665:
+/***/ 241:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 
-exports.URL = __nccwpck_require__(394)["interface"];
-exports.serializeURL = __nccwpck_require__(158).serializeURL;
-exports.serializeURLOrigin = __nccwpck_require__(158).serializeURLOrigin;
-exports.basicURLParse = __nccwpck_require__(158).basicURLParse;
-exports.setTheUsername = __nccwpck_require__(158).setTheUsername;
-exports.setThePassword = __nccwpck_require__(158).setThePassword;
-exports.serializeHost = __nccwpck_require__(158).serializeHost;
-exports.serializeInteger = __nccwpck_require__(158).serializeInteger;
-exports.parseURL = __nccwpck_require__(158).parseURL;
+exports.URL = __nccwpck_require__(622)["interface"];
+exports.serializeURL = __nccwpck_require__(282).serializeURL;
+exports.serializeURLOrigin = __nccwpck_require__(282).serializeURLOrigin;
+exports.basicURLParse = __nccwpck_require__(282).basicURLParse;
+exports.setTheUsername = __nccwpck_require__(282).setTheUsername;
+exports.setThePassword = __nccwpck_require__(282).setThePassword;
+exports.serializeHost = __nccwpck_require__(282).serializeHost;
+exports.serializeInteger = __nccwpck_require__(282).serializeInteger;
+exports.parseURL = __nccwpck_require__(282).parseURL;
 
 
 /***/ }),
 
-/***/ 158:
+/***/ 282:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
 
 const punycode = __nccwpck_require__(477);
-const tr46 = __nccwpck_require__(256);
+const tr46 = __nccwpck_require__(12);
 
 const specialSchemes = {
   ftp: 21,
@@ -7742,7 +7832,7 @@ module.exports.parseURL = function (input, options) {
 
 /***/ }),
 
-/***/ 185:
+/***/ 126:
 /***/ ((module) => {
 
 "use strict";
@@ -7770,7 +7860,7 @@ module.exports.implForWrapper = function (wrapper) {
 
 /***/ }),
 
-/***/ 877:
+/***/ 628:
 /***/ ((module) => {
 
 module.exports = eval("require")("encoding");
@@ -7842,7 +7932,7 @@ module.exports = require("zlib");
 
 /***/ }),
 
-/***/ 20:
+/***/ 229:
 /***/ ((module) => {
 
 "use strict";
@@ -8742,10 +8832,10 @@ systemJSPrototype.instantiate = function (url, parent, meta) {
   });
 };
 
-// EXTERNAL MODULE: ./node_modules/source-map-support/source-map-support.js
-var source_map_support = __nccwpck_require__(249);
-// EXTERNAL MODULE: ./node_modules/node-fetch/lib/index.js
-var lib = __nccwpck_require__(467);
+// EXTERNAL MODULE: ./node_modules/.pnpm/source-map-support@0.5.21/node_modules/source-map-support/source-map-support.js
+var source_map_support = __nccwpck_require__(501);
+// EXTERNAL MODULE: ./node_modules/.pnpm/node-fetch@2.7.0/node_modules/node-fetch/lib/index.js
+var lib = __nccwpck_require__(869);
 // EXTERNAL MODULE: external "fs"
 var external_fs_ = __nccwpck_require__(147);
 // EXTERNAL MODULE: external "url"
